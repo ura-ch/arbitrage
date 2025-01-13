@@ -1,0 +1,191 @@
+import android.os.Bundle
+import android.widget.Button
+import android.widget.EditText
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
+import androidx.room.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.withContext
+
+class MainActivity : AppCompatActivity() {
+
+    private val coinMarketCapUrl = "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/market-pairs/latest?slug=bitcoin&start=101&limit=100&category=spot&sort=cmc_rank_advanced"
+    private lateinit var database: AppDatabase
+    private lateinit var opportunityAdapter: OpportunityAdapter
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        database = Room.databaseBuilder(applicationContext, AppDatabase::class.java, "arbitrage-db").build()
+
+        val recyclerView: RecyclerView = findViewById(R.id.recyclerView)
+        recyclerView.layoutManager = LinearLayoutManager(this)
+        opportunityAdapter = OpportunityAdapter()
+        recyclerView.adapter = opportunityAdapter
+
+        val viewModel = ViewModelProvider(this)[OpportunityViewModel::class.java]
+
+        // Observe database changes and update UI
+        lifecycleScope.launch {
+            database.opportunityDao().getAll().collectLatest { opportunities ->
+                opportunityAdapter.submitList(opportunities)
+            }
+        }
+
+        // Fetch initial data
+        lifecycleScope.launch(Dispatchers.IO) {
+            val response = fetchData(coinMarketCapUrl)
+            if (response != null) {
+                val opportunities = analyzeArbitrageOpportunities(response)
+                saveOpportunities(opportunities)
+            }
+        }
+
+        // User input for currency
+        val currencyInput: EditText = findViewById(R.id.currencyInput)
+        val addButton: Button = findViewById(R.id.addButton)
+
+        addButton.setOnClickListener {
+            val currency = currencyInput.text.toString().trim().lowercase()
+            if (currency.isNotEmpty()) {
+                val websocketUrl = "wss://stream.binance.com:9443/ws/${currency}usdt@trade"
+                connectToWebSocket(websocketUrl)
+                Toast.makeText(this, "Subscribed to $currency/USDT", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Please enter a valid currency", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    // Function to fetch data from CoinMarketCap API
+    private fun fetchData(url: String): JSONObject? {
+        return try {
+            val client = OkHttpClient()
+            val request = Request.Builder().url(url).build()
+            val response = client.newCall(request).execute()
+
+            if (response.isSuccessful) {
+                val responseData = response.body?.string()
+                if (responseData != null) {
+                    JSONObject(responseData)
+                } else {
+                    null
+                }
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    // Function to analyze arbitrage opportunities
+    private fun analyzeArbitrageOpportunities(data: JSONObject): List<ArbitrageOpportunity> {
+        val opportunities = mutableListOf<ArbitrageOpportunity>()
+        val marketPairs = data.getJSONObject("data").getJSONArray("marketPairs")
+
+        for (i in 0 until marketPairs.length()) {
+            val pair = marketPairs.getJSONObject(i)
+            val exchange = pair.getJSONObject("exchange").getString("name")
+            val price = pair.getJSONObject("quote").getJSONObject("USD").getDouble("price")
+
+            // Simplified opportunity calculation (example logic)
+            opportunities.add(ArbitrageOpportunity(exchange, price))
+        }
+        return opportunities
+    }
+
+    // Function to save opportunities to the database
+    private suspend fun saveOpportunities(opportunities: List<ArbitrageOpportunity>) {
+        withContext(Dispatchers.IO) {
+            database.opportunityDao().insertAll(opportunities)
+        }
+    }
+
+    // Function to connect to WebSocket for a specific URL
+    private fun connectToWebSocket(url: String) {
+        val client = OkHttpClient()
+        val request = Request.Builder().url(url).build()
+        val webSocket = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                super.onMessage(webSocket, text)
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val data = JSONObject(text)
+                    val opportunity = ArbitrageOpportunity(
+                        exchange = data.getString("e"),
+                        price = data.getDouble("p")
+                    )
+                    saveOpportunities(listOf(opportunity))
+                }
+            }
+        })
+    }
+
+    @Entity
+    data class ArbitrageOpportunity(
+        @PrimaryKey(autoGenerate = true) val id: Int = 0,
+        val exchange: String,
+        val price: Double
+    )
+
+    @Dao
+    interface OpportunityDao {
+        @Insert(onConflict = OnConflictStrategy.REPLACE)
+        suspend fun insertAll(opportunities: List<ArbitrageOpportunity>)
+
+        @Query("SELECT * FROM ArbitrageOpportunity")
+        fun getAll(): Flow<List<ArbitrageOpportunity>>
+    }
+
+    @Database(entities = [ArbitrageOpportunity::class], version = 1)
+    abstract class AppDatabase : RoomDatabase() {
+        abstract fun opportunityDao(): OpportunityDao
+    }
+
+    // RecyclerView Adapter
+    class OpportunityAdapter : RecyclerView.Adapter<OpportunityAdapter.ViewHolder>() {
+
+        private var opportunities: List<ArbitrageOpportunity> = emptyList()
+
+        fun submitList(newList: List<ArbitrageOpportunity>) {
+            opportunities = newList
+            notifyDataSetChanged()
+        }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
+            val view = LayoutInflater.from(parent.context).inflate(R.layout.item_opportunity, parent, false)
+            return ViewHolder(view)
+        }
+
+        override fun onBindViewHolder(holder: ViewHolder, position: Int) {
+            val opportunity = opportunities[position]
+            holder.bind(opportunity)
+        }
+
+        override fun getItemCount(): Int = opportunities.size
+
+        class ViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+            private val exchangeView: TextView = itemView.findViewById(R.id.exchange)
+            private val priceView: TextView = itemView.findViewById(R.id.price)
+
+            fun bind(opportunity: ArbitrageOpportunity) {
+                exchangeView.text = opportunity.exchange
+                priceView.text = opportunity.price.toString()
+            }
+        }
+    }
+}
